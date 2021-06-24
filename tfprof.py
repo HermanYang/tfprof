@@ -1,5 +1,3 @@
-# Copyright 2020 Cambricon
-# =============================================================================
 import ujson as json
 import os
 import shutil

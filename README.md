@@ -9,8 +9,6 @@
     profiler = Profiler(options=ProfilerOptions(host_tracer_level=2, device_tracer_level=1))
     ```
 
-    profiler 性能采集 level 由 host_tracer_level 和 device_tracer_level 控制，默认 host_tracer_level=2、device_tracer_level=0
-
 2. Integation
 
     ```python
@@ -41,12 +39,6 @@
     ```
 
 ## ProfilerOptions
-
-- host_tracer_level=0, device_tracer_level=0：关闭 host tracer，关闭 device tracer，会输出端到端性能数据；
-- host_tracer_level=1, device_tracer_level=0: host tracer 采集 host 侧 Critical 性能信息；
-- host_tracer_level=2, device_tracer_level=0: host tracer 在采集 host 侧 Critical 和 Info 等级的性能信息，详情参见 tensorflow/core/profiler/lib/traceme.h 对 host 侧性能信息等级定义；
-- host_tracer_level=0, device_tracer_level=1: 只开启 device tracer，可以采集 device 端的性能数据和 mlu 运行时的性能数据；
-- host_tracer_level=2, device_tracer_level=1: 开启 host tracer 和 device tracer 并采集全部性能数据；
 
 ## Outputs
 
