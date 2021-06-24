@@ -1,14 +1,16 @@
 # Copyright 2020 Cambricon
 # =============================================================================
-from analyze import Analyzer
-from absl import logging
 import ujson as json
 import os
 import shutil
 import time
 import threading
 import collections
-
+import numpy
+import pandas
+from absl import logging
+from google.protobuf import text_format
+from tensorflow.core.framework import step_stats_pb2
 from tensorflow.python.client import timeline
 from tensorflow.python.keras.callbacks import Callback
 from tensorflow.python.training import session_run_hook
@@ -65,13 +67,12 @@ class Profiler(object):
   # build-in activities
   _SESSION_RUN_ACTIVITY = "Session Run"
 
-  def __init__(self,  logdir='profile', options=ProfilerOptions()):
+  def __init__(self,  logdir='logdir', options=ProfilerOptions()):
 
     self._set_options(options)
 
     # create folders to save profile data
-    self._logdir = os.getenv(
-      'TF_PROFILE_LOGDIR', logdir)
+    self._logdir = logdir
     if os.path.exists(self._logdir):
       shutil.rmtree(self._logdir)
     os.makedirs(self._logdir)
@@ -85,8 +86,7 @@ class Profiler(object):
     self._activity_stats_collection = {}
     # activity lut for internal used
     self._activity_stats_collection['lut'] = {}
-
-    self._tf_stats_collection = {}
+    self._step_stats_list = {}
 
   def _is_python_tracer_enabled(self):
     return self._options.python_tracer_level > 0
@@ -131,19 +131,19 @@ class Profiler(object):
     if not (self._is_host_tracer_enabled() or self._is_device_tracer_enabled()):
       return None
     else:
-      if not self._tf_stats_collection:
-        self._tf_stats_collection.update(
+      if not self._step_stats_list:
+        self._step_stats_list.update(
           {"current_step": -1, "step_stats": {}, "run_metadata": config_pb2.RunMetadata()})
       else:
-        self._tf_stats_collection["run_metadata"] = config_pb2.RunMetadata()
-      return self._tf_stats_collection["run_metadata"]
+        self._step_stats_list["run_metadata"] = config_pb2.RunMetadata()
+      return self._step_stats_list["run_metadata"]
 
   def step_start(self):
     """
       Function to mark just before session run start
     """
-    if not self._tf_stats_collection:
-      self._tf_stats_collection.update(
+    if not self._step_stats_list:
+      self._step_stats_list.update(
         {"current_step": -1, "step_stats": {}, "run_metadata": None})
 
     session_run_activity_name = self._get_session_run_activity_name()
@@ -162,9 +162,9 @@ class Profiler(object):
     if not (self._is_host_tracer_enabled() or self._is_device_tracer_enabled()):
       return
 
-    self._tf_stats_collection["current_step"] = step
+    self._step_stats_list["current_step"] = step
     if run_metadata is None:
-      run_metadata = self._tf_stats_collection['run_metadata']
+      run_metadata = self._step_stats_list['run_metadata']
     assert run_metadata, 'Step {} run_metadata required'.format(step)
     self._save_session_run_metadata(run_metadata, step)
 
@@ -201,8 +201,7 @@ class Profiler(object):
       'activity {} not start yet, make sure invoke activity_start first'.format(
       activity_name)
 
-    self._activity_stats_collection['lut'][activity_name]['end'] = time.time(
-    )
+    self._activity_stats_collection['lut'][activity_name]['end'] = time.time()
     if step not in self._activity_stats_collection:
       self._activity_stats_collection[step] = {}
 
@@ -279,7 +278,7 @@ class Profiler(object):
     return train_step
 
 
-  def finalize(self, analyze=True, batch_size=0, **kwargs):
+  def finalize(self, batch_size=0, **kwargs):
     """Function generate profile summary
 
     Args:
@@ -294,9 +293,8 @@ class Profiler(object):
     with open(activity_stats_collection_json_path, "w+") as file:
       file.write(activity_stats_collection_json)
 
-    if analyze:
-      Analyzer(self._logdir, batch_size, self._activity_stats_collection,
-           self._tf_stats_collection, **kwargs).generate_summary()
+    Analyzer(self._logdir, batch_size, self._activity_stats_collection,
+           self._step_stats_list, **kwargs).generate_summary()
 
   def _get_session_run_activity_name(self):
     return Profiler._SESSION_RUN_ACTIVITY
@@ -314,11 +312,11 @@ class Profiler(object):
     if not (self._is_host_tracer_enabled() or self._is_device_tracer_enabled()):
       return
 
-    if step in self._tf_stats_collection["step_stats"]:
+    if step in self._step_stats_list["step_stats"]:
       # ignore duplicated steps
       logging.warning('step {} duplicated'.format(step))
 
-    self._tf_stats_collection["step_stats"][step] = run_metadata.step_stats
+    self._step_stats_list["step_stats"][step] = run_metadata.step_stats
 
     # saving step_stats and timeline
     step_stats_saving_thread = threading.Thread(
@@ -397,3 +395,224 @@ class ProfilerHook(session_run_hook.SessionRunHook):
     elif ((self._start_step and global_step < (self._start_step - 1)) or (self._end_step and global_step >= self._end_step)):
       # turn off
       self._profiler._set_options(ProfilerOptions(host_tracer_level=0, device_tracer_level=0))
+
+def microsecond_to_nanosecond(us):
+    return us * 1000
+
+class Analyzer(object):
+    # build-in activities
+    _SESSION_RUN_ACTIVITY = "Session Run"
+
+    def __init__(self, logdir, batch_size, activity_stats_collection = None, step_stats_list=None):
+        self._logdir = logdir
+        self._batch_size = batch_size
+        self._step_stats_list = {}
+        self._activity_stats_collection = {}
+
+        assert(os.path.exists(logdir))
+        if activity_stats_collection:
+            self._activity_stats_collection = activity_stats_collection
+        else:
+            activity_stats_collection_json_file_path = os.path.join(logdir, '{}.json'.format(Analyzer._ACTIVITY_STATS_COLLECTION_FILE_NAME))
+            assert os.path.exists(activity_stats_collection_json_file_path),'path {} not exist'.format(activity_stats_collection_json_file_path)
+            with open(activity_stats_collection_json_file_path) as file:
+                self._activity_stats_collection = json.load(file)
+
+        if step_stats_list:
+            self._step_stats_list = step_stats_list
+        else:
+            step_stats_folder_path = os.path.join(logdir, "step_stats")
+            assert os.path.exists(step_stats_folder_path), 'path {} not exist'.format(step_stats_folder_path)
+            step_stats_file_names = os.listdir(step_stats_folder_path)
+            for step_stats_file_name in step_stats_file_names:
+                self._step_stats_list = {"step_stats":{}}
+                step = step_stats_file_name.split("_")[-1]
+                step_stats_file_path = os.path.join(step_stats_folder_path, step_stats_file_name)
+                with open(step_stats_file_path) as step_stats_pbtxt:
+                    self._step_stats_list["step_stats"][step] = text_format.Parse(step_stats_pbtxt.read(), step_stats_pb2.StepStats())
+        
+    def _get_session_run_activity_name(self):
+        return Analyzer._SESSION_RUN_ACTIVITY
+
+    def generate_overall_stats(self):
+        activity_stats = {}
+        for step in self._activity_stats_collection:
+            activity_stats[step] = {}
+            for activity_name in self._activity_stats_collection[step]:
+                elapse = self._activity_stats_collection[step][activity_name]["end"] - self._activity_stats_collection[step][activity_name]["start"]
+                activity_stats[step][activity_name] = {"elapse":elapse}
+        activity_overall_stats = {}
+        activity_step_times = {}
+        activity_step_times[self._get_session_run_activity_name()] = []
+        for step in activity_stats:
+            for session_run_activity_name in activity_step_times:
+                activity_step_times[session_run_activity_name].append(activity_stats[step][session_run_activity_name]["elapse"])
+
+        for session_run_activity_name, step_times in activity_step_times.items():
+            total_time = numpy.sum(numpy.asarray(step_times))
+
+            throughput = "N/A"
+            throughput_min = "N/A"
+            throughput_mean = "N/A"
+            throughput_median = "N/A"
+            throughput_max = "N/A"
+            throughput_99th_percentile = "N/A"
+
+            the_99th_percentile = "N/A"
+            latency_mean = "N/A"
+            latency_median = "N/A"
+            latency_min = "N/A"
+            latency_max = "N/A"
+
+            if self._batch_size > 0 and step_times:
+                throughput = self._batch_size / numpy.asarray(step_times)
+                throughput_min = numpy.min(throughput)
+                throughput_mean = numpy.mean(throughput)
+                throughput_median = numpy.median(throughput)
+                throughput_max = numpy.max(throughput)
+                throughput_99th_percentile = numpy.percentile(numpy.asarray(throughput), q=99, interpolation="lower")
+
+                the_99th_percentile = numpy.percentile(numpy.asarray(step_times), q=99, interpolation="lower")
+                latency_mean = numpy.mean(numpy.asarray(step_times))
+                latency_median = numpy.median(numpy.asarray(step_times))
+                latency_min= numpy.min(numpy.asarray(step_times))
+                latency_max= numpy.max(numpy.asarray(step_times))
+
+            overall_stats = {
+                "batch_size": self._batch_size,
+                "total_time": total_time,
+                "throughput_min": throughput_min,
+                "throughput_mean":throughput_mean,
+                "throughput_median": throughput_median,
+                "throughput_max": throughput_max,
+                "throughput_99th_percentile":throughput_99th_percentile,
+                "latency_99th_percentile": the_99th_percentile,
+                "latency_mean": latency_mean,
+                "latency_median": latency_median,
+                "latency_min": latency_min,
+                "latency_max": latency_max,
+            }
+            activity_overall_stats = overall_stats
+        return activity_overall_stats
+
+    def generate_json_summary(self, **kwargs):
+        summary = {}
+        for name, value in kwargs.items():
+            summary[name] = value
+        summary_json_file_path = "{}/{}.json".format(self._logdir, Analyzer._SUMMARIES_FILE_NAME)
+        summary_json = json.dumps(summary, indent = 2)
+        with open(summary_json_file_path,"w+") as f:
+            f.write(summary_json)
+    
+    # trim dupliacted information in step_stats
+    def trim_step_stats(step_stats):            
+        trimmed_step_stats=step_stats_pb2.StepStats()
+        collector_stats_list = []
+        # found duplicated stats on host
+        for dev_stats in step_stats.dev_stats:
+            if dev_stats.device == "/host:CPU" or "stream:all" in dev_stats.device:
+                continue
+            elif "job" in dev_stats.device:
+                collector_stats_list.append(dev_stats)
+                continue
+            else:
+                _dev_stats = trimmed_step_stats.dev_stats.add() 
+                _dev_stats.CopyFrom(dev_stats)
+        # merge duplicated host traces
+        _host_stats = trimmed_step_stats.dev_stats.add()
+        _host_stats.device = "/host:CPU"
+        for _dev_stats in collector_stats_list:
+            for node_stats in _dev_stats.node_stats:
+                _node_stats = _host_stats.node_stats.add()
+                _node_stats.CopyFrom(node_stats)
+        return trimmed_step_stats
+    
+    def extract_kernel_stats(trimmed_step_stats):
+        # the patten is:
+        # op_id:op_type#key1=value1,key2=value2#@@kernel_name
+        def _parse_kernel_node_name(node_name):
+            op_id = 'unknown'
+            op_type = 'unknown'
+            kernel_name = 'unknown'
+            kernel_name_start_index = node_name.rfind('@@')
+            if kernel_name_start_index > 0:
+                kernel_name = node_name[kernel_name_start_index + 2:] # skip '@@'
+                # remove kernel name info
+                node_name = node_name[:kernel_name_start_index]
+            op_id_end_index = node_name.find(':')
+            if op_id_end_index > 0:
+                op_id = node_name[:op_id_end_index]
+                # remove op name info
+                node_name = node_name[op_id_end_index + 1:] # skip ':'
+            op_type_end_index = node_name.find('#')
+            if op_type_end_index > 0:
+                op_type = node_name[:op_type_end_index]
+                # remove op type info
+                node_name = node_name[op_type_end_index + 1:] # skip '#'
+            return op_id, op_type, kernel_name
+
+        kernel_stats_list = []
+        for dev_stats in trimmed_step_stats.dev_stats:
+            if "gpu" in dev_stats.device and "MemcpyDtoH" not in dev_stats.device and "MemcpyHtoD" not in dev_stats.device:
+                kernel_stats_list.append(dev_stats)
+        kernel_stats = pandas.DataFrame(columns = ['op_type', 'op_id', 'kernel_name', 'start_ns', 'elapse_ns', 'use_tensor_core'])
+        for dev_stats in kernel_stats_list:
+            for node_stats in dev_stats.node_stats:
+                op_id, op_type, kernel_name = _parse_kernel_node_name(node_stats.node_name)
+                start_ns =  microsecond_to_nanosecond(node_stats.all_start_micros)
+                elapse_ns =  microsecond_to_nanosecond(node_stats.all_end_rel_micros)
+                kernel_stats = kernel_stats.append({'op_type':op_type, 'op_id':op_id, 'kernel_name':kernel_name, 'start_ns':start_ns, 'elapse_ns':elapse_ns}, ignore_index=True)
+        return kernel_stats
+
+    def extract_host_op_stats(trimmed_step_stats):
+        # [allocator_name total_memory peak_memory] op_id = op_type(input_op_name1, input_op_name2, ...)
+        def _parse_op_timeline_label(timeline_label):
+            op_id = 'unknown'
+            op_type = 'unknown'
+            allocation_info_end_index = timeline_label.find(']')
+            if allocation_info_end_index > 0:
+                timeline_label = timeline_label[allocation_info_end_index + 1:] # just ignore memory info
+            op_id_end_index = timeline_label.find('=')
+            if op_id_end_index > 0:
+                op_id = timeline_label[:op_id_end_index]
+                op_id = op_id.strip()
+                #remove op_id info
+                timeline_label = timeline_label[op_id_end_index + 1:] # skip '='
+            op_type_end_index = timeline_label.find('(')
+            if op_type_end_index > 0:
+                op_type = timeline_label[:op_type_end_index]
+                op_type = op_type.strip()
+                # remove op_type info
+                timeline_label = timeline_label[op_type_end_index + 1:] # skip '('
+            return op_id, op_type
+        host_stats = None
+        for dev_stats in trimmed_step_stats.dev_stats:
+            if dev_stats.device == '/host:CPU':
+                host_stats = dev_stats
+        if host_stats is None:
+            return
+        host_op_stats = pandas.DataFrame(columns = ['op_type', 'op_id', 'start_ns', 'elapse_ns'])
+        for node_stats in host_stats.node_stats:
+            op_id, op_type = _parse_op_timeline_label(node_stats.timeline_label)
+            start_ns =  node_stats.all_start_nanos
+            elapse_ns =  node_stats.all_end_rel_nanos
+            host_op_stats = host_op_stats.append({'op_type':op_type, 'op_id':op_id, 'start_ns':start_ns, 'elapse_ns':elapse_ns}, ignore_index=True)
+        return host_op_stats 
+
+    def generate_summary(self):
+        # e2e stats
+        print(self.generate_overall_stats())
+
+        # op stats
+        op_stats = pandas.DataFrame(columns = ['step', 'op_type', 'op_id', 'start_ns', 'host_elapse_ns', 'devie_elapse_ns', 'is_kernen_launch', 'run_on'])
+        for step, step_stats in self._step_stats_list["step_stats"].items():
+            trimmed_step_stats = Analyzer.trim_step_stats(step_stats)
+            host_op_stats = Analyzer.extract_host_op_stats(trimmed_step_stats)
+            kernel_stats  = Analyzer.extract_kernel_stats(trimmed_step_stats)
+            op_stats = pandas.merge(host_op_stats.rename(columns={'elapse_ns':'host_elapse_ns', 'start_ns':'host_start_ns'}), 
+                kernel_stats.rename(columns={'elapse_ns':'kernel_elapse_ns', 'start_ns':'kernel_start_ns'}),
+                how='left', on=['op_type', 'op_id'])
+        print(op_stats)
+        op_stats.to_json("op_stats.json")
+        op_stats.to_excel("op_stats.xlsx")
+        op_stats.to_csv("op_stats.csv")

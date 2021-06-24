@@ -1,4 +1,3 @@
-
 def TFLowLevelApi_TrainAndInference():
     import tensorflow as tf
     from tensorflow.examples.tutorials.mnist import input_data
@@ -36,7 +35,7 @@ def TFLowLevelApi_TrainAndInference():
     sess = tf.compat.v1.Session()
     sess.run(tf.compat.v1.global_variables_initializer())
 
-    from profile import Profiler, ProfilerOptions
+    from tfprof import Profiler, ProfilerOptions
 
     profiler = Profiler(options=ProfilerOptions(host_tracer_level=2, device_tracer_level=1))
     run_options = tf.compat.v1.RunOptions(trace_level = profiler.get_trace_level())
@@ -44,7 +43,7 @@ def TFLowLevelApi_TrainAndInference():
     # Train
     mnist_data_set = input_data.read_data_sets('MNIST_data', one_hot=True)
     batch_size = 256
-    for step in range(1000):
+    for step in range(100):
         # 取训练数据
         batch_xs, batch_ys = mnist_data_set.train.next_batch(batch_size)
         if step == 10:
@@ -54,7 +53,6 @@ def TFLowLevelApi_TrainAndInference():
             profiler.step_end(step)
         print("Step: {}, Accuracy: {}, Loss: {}".format(step, acc, loss))
 
-    profiler.finalize(batch_size=batch_size, analyze=True)
-
+    profiler.finalize(batch_size=batch_size)
 
 TFLowLevelApi_TrainAndInference()
