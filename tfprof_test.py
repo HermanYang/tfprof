@@ -30,7 +30,7 @@ def TFLowLevelApi_TrainAndInference():
     cross_entropy = -tf.reduce_sum(y_ * tf.log(y_conv))
     train_step = tf.train.GradientDescentOptimizer(0.001).minimize(cross_entropy)
     corrent_prediction = tf.equal(tf.argmax(y_conv, 1), tf.argmax(y_, 1))
-    accuracy = tf.reduce_mean(tf.cast(corrent_prediction, "float"))
+    accuracy = tf.reduce_mean(tf.cast(corrent_prediction, 'float'))
 
     sess = tf.compat.v1.Session()
     sess.run(tf.compat.v1.global_variables_initializer())
@@ -39,6 +39,7 @@ def TFLowLevelApi_TrainAndInference():
 
     profiler = Profiler(options=ProfilerOptions(host_tracer_level=2, device_tracer_level=1))
     run_options = tf.compat.v1.RunOptions(trace_level = profiler.get_trace_level())
+    run_options.output_partition_graphs = True
 
     # Train
     mnist_data_set = input_data.read_data_sets('MNIST_data', one_hot=True)
@@ -51,7 +52,7 @@ def TFLowLevelApi_TrainAndInference():
         acc, loss = sess.run([accuracy, cross_entropy], feed_dict={x: batch_xs, y_: batch_ys}, options=run_options, run_metadata=profiler.get_run_metadata())
         if step == 10:
             profiler.step_end(step)
-        print("Step: {}, Accuracy: {}, Loss: {}".format(step, acc, loss))
+        print('Step: {}, Accuracy: {}, Loss: {}'.format(step, acc, loss))
 
     profiler.finalize(batch_size=batch_size)
 

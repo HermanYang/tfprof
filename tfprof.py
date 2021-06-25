@@ -16,12 +16,15 @@ from tensorflow.python.training.session_run_hook import SessionRunArgs
 from tensorflow.core.protobuf import config_pb2
 from tensorflow.python.training import training_util
 
+def microsecond_to_nanosecond(us):
+    return us * 1000
+
 class ProfilerOptions(
     collections.namedtuple('ProfilerOptions', [
       'host_tracer_level', 'python_tracer_level', 'device_tracer_level',
       'delay_ms'
     ])):
-  """Options for finer control over the profiler.
+  '''Options for finer control over the profiler.
 
   Use `tfprof.profiler.ProfilerOptions` to control `tfprof.profiler.Profiler`
   behavior.
@@ -39,7 +42,7 @@ class ProfilerOptions(
       request. Default value is None, allowing the profiler guess the best
       value.
 
-  """
+  '''
 
   def __new__(cls,
         host_tracer_level=2,
@@ -52,21 +55,21 @@ class ProfilerOptions(
 
 
 class Profiler(object):
-  """Profiler class for application activity profiling and tensorflow profiling.
-  """
+  '''Profiler class for application activity profiling and tensorflow profiling.
+  '''
 
   # folder names
-  _TIMELINE_FOLDER_NAME = "timeline"
-  _STEP_STATS_FOLDER_NAME = "step_stats"
+  _TIMELINE_FOLDER_NAME = 'timeline'
+  _STEP_STATS_FOLDER_NAME = 'step_stats'
+  _PARTITION_GRAPH_FOLDER_NAME = 'partition_graphs'
 
   # file names
-  _ACTIVITY_STATS_COLLECTION_JSON_FILE_NAME = "activity_stats_collection.json"
+  _ACTIVITY_STATS_COLLECTION_JSON_FILE_NAME = 'activity_stats_collection.json'
 
   # build-in activities
-  _SESSION_RUN_ACTIVITY = "Session Run"
+  _SESSION_RUN_ACTIVITY = 'Session Run'
 
   def __init__(self,  logdir='logdir', options=ProfilerOptions()):
-
     self._set_options(options)
 
     # create folders to save profile data
@@ -74,17 +77,21 @@ class Profiler(object):
     if os.path.exists(self._logdir):
       shutil.rmtree(self._logdir)
     os.makedirs(self._logdir)
-    self._timeline_folder = "{}/{}".format(
+    self._timeline_folder = '{}/{}'.format(
       self._logdir, Profiler._TIMELINE_FOLDER_NAME)
-    self._step_stats_folder = "{}/{}".format(
+    self._step_stats_folder = '{}/{}'.format(
       self._logdir, Profiler._STEP_STATS_FOLDER_NAME)
+    self._partition_graph_folder = '{}/{}'.format(
+      self._logdir, Profiler._PARTITION_GRAPH_FOLDER_NAME)
     os.mkdir(self._timeline_folder)
     os.mkdir(self._step_stats_folder)
+    os.mkdir(self._partition_graph_folder)
 
     self._activity_stats_collection = {}
     # activity lut for internal used
     self._activity_stats_collection['lut'] = {}
-    self._step_stats_list = {}
+    self._raw_stats = {}
+    self._run_metadata = None
 
   def _is_python_tracer_enabled(self):
     return self._options.python_tracer_level > 0
@@ -97,17 +104,17 @@ class Profiler(object):
 
   def _set_options(self, options):
     assert options.host_tracer_level in [
-      0, 1, 2, 3], "invalid host_tracer_level {}, should be one of [0, 1, 2, 3]".format(options.host_tracer_level)
+      0, 1, 2, 3], 'invalid host_tracer_level {}, should be one of [0, 1, 2, 3]'.format(options.host_tracer_level)
     assert options.device_tracer_level in [
-      0, 1], "invalid device_tracer_level {}, should be one of [0, 1]".format(options.device_tracer_level)
+      0, 1], 'invalid device_tracer_level {}, should be one of [0, 1]'.format(options.device_tracer_level)
     self._options = options
   
   def _get_options(self):
     return self._options
 
   def get_trace_level(self):
-    """Function to get tensorflow trace level depends on Profiler trace level.
-    """
+    '''Function to get tensorflow trace level depends on Profiler trace level.
+    '''
     if self._options.host_tracer_level == 0 and self._options.device_tracer_level == 0:
       return config_pb2.RunOptions.NO_TRACE
     elif self._options.host_tracer_level == 1 and self._options.device_tracer_level == 0:
@@ -123,36 +130,33 @@ class Profiler(object):
         'unknown profile options {}'.format(str(self._options)))
 
   def get_run_metadata(self):
-    """
+    '''
       Function to create tensorflow RunMetadata
-    """
+    '''
     if not (self._is_host_tracer_enabled() or self._is_device_tracer_enabled()):
       return None
     else:
-      if not self._step_stats_list:
-        self._step_stats_list.update(
-          {"current_step": -1, "step_stats": {}, "run_metadata": config_pb2.RunMetadata()})
-      else:
-        self._step_stats_list["run_metadata"] = config_pb2.RunMetadata()
-      return self._step_stats_list["run_metadata"]
+      if not self._run_metadata:
+        self._run_metadata = config_pb2.RunMetadata()
+      return self._run_metadata
 
   def step_start(self):
-    """
+    '''
       Function to mark just before session run start
-    """
-    if not self._step_stats_list:
-      self._step_stats_list.update(
-        {"current_step": -1, "step_stats": {}, "run_metadata": None})
+    '''
+    if not self._raw_stats:
+      self._raw_stats.update(
+        {'step_stats': {}, 'partition_graphs':{}})
 
     session_run_activity_name = self._get_session_run_activity_name()
     self.activity_start(session_run_activity_name)
 
   def step_end(self, step, run_metadata=None):
-    """Function to mark just after session run end
+    '''Function to mark just after session run end
 
     Args:
       run_metadata: Tensorflow run_metadata in case didn't have chances to invoke get_run_metadata linking run_metadata before
-    """
+    '''
     # record session run activity
     session_run_activity_name = self._get_session_run_activity_name()
     self.activity_end(session_run_activity_name, step)
@@ -160,16 +164,15 @@ class Profiler(object):
     if not (self._is_host_tracer_enabled() or self._is_device_tracer_enabled()):
       return
 
-    self._step_stats_list["current_step"] = step
     if run_metadata is None:
-      run_metadata = self._step_stats_list['run_metadata']
+      run_metadata = self._run_metadata
     assert run_metadata, 'Step {} run_metadata required'.format(step)
     self._save_session_run_metadata(run_metadata, step)
 
   def get_keras_profile_callback(self, start_step=None, end_step=None):
-    """
+    '''
       Function to create keras profiler callback
-    """
+    '''
     return KerasProfileCallback(self, start_step, end_step)
 
   def get_estimator_profile_hook(self, start_step=None, end_step=None):
@@ -179,22 +182,22 @@ class Profiler(object):
     return ProfilerHook(self, start_step, end_step)
 
   def activity_start(self, activity_name):
-    """Function to mark just before self defined activity start
+    '''Function to mark just before self defined activity start
 
     Args:
       activity_name: activity name as a string
       step: activity step associate with training or evalutation, if step =-1 means step agnostic activity
-    """
+    '''
     self._activity_stats_collection['lut'][activity_name] = {
-      "start": time.time(), "end": time.time()}
+      'start': time.time(), 'end': time.time()}
 
   def activity_end(self, activity_name, step=-1):
-    """Function to mark just after self defined activity start
+    '''Function to mark just after self defined activity start
 
     Args:
       activity_name: activity name as a string
       step: activity step associate with training or evalutation, if step =-1 means step agnostic activity
-    """
+    '''
     assert activity_name in self._activity_stats_collection['lut'], \
       'activity {} not start yet, make sure invoke activity_start first'.format(
       activity_name)
@@ -209,9 +212,9 @@ class Profiler(object):
     self._activity_stats_collection[step][activity_name] = self._activity_stats_collection['lut'][activity_name]
 
   def get_slim_train_step_fn(self, start_step=None, end_step=None):
-    """
+    '''
       Function to get slim train step function clousure link to graph name
-    """
+    '''
     _start_step = start_step
     _end_step = end_step
     _profiler = self
@@ -222,7 +225,7 @@ class Profiler(object):
       self._set_options(ProfilerOptions(host_tracer_level=0, device_tracer_level=0))
 
     def train_step(sess, train_op, global_step, train_step_kwargs):
-      """Function that takes a gradient step and specifies whether to stop.
+      '''Function that takes a gradient step and specifies whether to stop.
       
       Args:
         sess: The current session.
@@ -234,7 +237,7 @@ class Profiler(object):
       Returns:
         The total loss and a boolean indicating whether or not to stop training.
       
-      """
+      '''
 
       run_options = config_pb2.RunOptions(
         trace_level=_profiler.get_trace_level())
@@ -267,8 +270,8 @@ class Profiler(object):
           logging.info('global step %d: loss = %.4f (%.3f sec/step)',
                 np_global_step, total_loss, time_elapsed)
 
-      if "should_stop" in train_step_kwargs:
-        should_stop = sess.run(train_step_kwargs["should_stop"])
+      if 'should_stop' in train_step_kwargs:
+        should_stop = sess.run(train_step_kwargs['should_stop'])
       else:
         should_stop = False
       return total_loss, should_stop
@@ -277,50 +280,56 @@ class Profiler(object):
 
 
   def finalize(self, batch_size=0, **kwargs):
-    """Function generate profile summary
+    '''Function generate profile summary
 
     Args:
       batch_size: batch size for training or evalutation
-    """
+    '''
     # pop activity internal data lut before json dump
     self._activity_stats_collection.pop('lut')
     activity_stats_collection_json = json.dumps(
       self._activity_stats_collection)
-    activity_stats_collection_json_path = "{}/{}".format(
+    activity_stats_collection_json_path = '{}/{}'.format(
       self._logdir, Profiler._ACTIVITY_STATS_COLLECTION_JSON_FILE_NAME)
-    with open(activity_stats_collection_json_path, "w+") as file:
+    with open(activity_stats_collection_json_path, 'w+') as file:
       file.write(activity_stats_collection_json)
 
     Analyzer(self._logdir, batch_size, self._activity_stats_collection,
-           self._step_stats_list, **kwargs).generate_summary()
+           self._raw_stats, **kwargs).generate_summary()
 
   def _get_session_run_activity_name(self):
     return Profiler._SESSION_RUN_ACTIVITY
 
   def _save_timeline(self, step, step_stats):
-    with open(os.path.join(self._timeline_folder, "{}_{}".format("timeline", step)), 'w+') as file:
+    with open(os.path.join(self._timeline_folder, '{}_{}'.format('timeline', step)), 'w+') as file:
       file.write(timeline.Timeline(step_stats).generate_chrome_trace_format(
         show_dataflow=True, show_memory=True))
 
   def _save_step_stats(self, step, step_stats):
-    with open(os.path.join(self._step_stats_folder, "{}_{}".format("stats", step)), 'w+') as file:
+    with open(os.path.join(self._step_stats_folder, '{}_{}'.format('stats', step)), 'w+') as file:
       file.write(step_stats.__str__())
+
 
   def _save_session_run_metadata(self, run_metadata, step):
     if not (self._is_host_tracer_enabled() or self._is_device_tracer_enabled()):
       return
 
-    if step in self._step_stats_list["step_stats"]:
+    if step in self._raw_stats['step_stats']:
       # ignore duplicated steps
       logging.warning('step {} duplicated'.format(step))
 
-    self._step_stats_list["step_stats"][step] = run_metadata.step_stats
+    self._raw_stats['step_stats'][step] = run_metadata.step_stats
+    self._raw_stats['partition_graphs'][step] = run_metadata.partition_graphs
 
     # saving step_stats and timeline
     step_stats_saving_thread = threading.Thread(
       target=Profiler._save_step_stats, args=(self, step, run_metadata.step_stats))
     timeline_saving_thread = threading.Thread(
       target=Profiler._save_timeline, args=(self, step, run_metadata.step_stats))
+
+    for partition_graph in run_metadata.partition_graphs:
+      print('======================================================================')
+      print(partition_graph)
     step_stats_saving_thread.start()
     timeline_saving_thread.start()
     step_stats_saving_thread.join()
@@ -369,13 +378,13 @@ class ProfilerHook(session_run_hook.SessionRunHook):
   def begin(self):
     self._global_step_tensor = training_util._get_or_create_global_step_read()  # pylint: disable=protected-access
     if self._global_step_tensor is None:
-      raise RuntimeError("Global step should be created to use ProfilerHook.")
+      raise RuntimeError('Global step should be created to use ProfilerHook.')
     # turn off profiling(to Profiler._PROFILE_APP_ACTIVITIES) if start step > 0
     if self._start_step and self._start_step > 0:
       self._profiler._set_options(ProfilerOptions(host_tracer_level=0, device_tracer_level=0))
 
   def before_run(self, run_context):
-    requests = {"global_step": self._global_step_tensor}
+    requests = {'global_step': self._global_step_tensor}
     opts = (
       config_pb2.RunOptions(trace_level=self._profiler.get_trace_level()))
     self._profiler.step_start()
@@ -394,17 +403,15 @@ class ProfilerHook(session_run_hook.SessionRunHook):
       # turn off
       self._profiler._set_options(ProfilerOptions(host_tracer_level=0, device_tracer_level=0))
 
-def microsecond_to_nanosecond(us):
-    return us * 1000
 
 class Analyzer(object):
     # build-in activities
-    _SESSION_RUN_ACTIVITY = "Session Run"
+    _SESSION_RUN_ACTIVITY = 'Session Run'
 
     def __init__(self, logdir, batch_size, activity_stats_collection = None, step_stats_list=None):
         self._logdir = logdir
         self._batch_size = batch_size
-        self._step_stats_list = {}
+        self._raw_stats = {}
         self._activity_stats_collection = {}
 
         assert(os.path.exists(logdir))
@@ -417,17 +424,17 @@ class Analyzer(object):
                 self._activity_stats_collection = json.load(file)
 
         if step_stats_list:
-            self._step_stats_list = step_stats_list
+            self._raw_stats = step_stats_list
         else:
-            step_stats_folder_path = os.path.join(logdir, "step_stats")
+            step_stats_folder_path = os.path.join(logdir, 'step_stats')
             assert os.path.exists(step_stats_folder_path), 'path {} not exist'.format(step_stats_folder_path)
             step_stats_file_names = os.listdir(step_stats_folder_path)
             for step_stats_file_name in step_stats_file_names:
-                self._step_stats_list = {"step_stats":{}}
-                step = step_stats_file_name.split("_")[-1]
+                self._raw_stats = {'step_stats':{}}
+                step = step_stats_file_name.split('_')[-1]
                 step_stats_file_path = os.path.join(step_stats_folder_path, step_stats_file_name)
                 with open(step_stats_file_path) as step_stats_pbtxt:
-                    self._step_stats_list["step_stats"][step] = text_format.Parse(step_stats_pbtxt.read(), step_stats_pb2.StepStats())
+                    self._raw_stats['step_stats'][step] = text_format.Parse(step_stats_pbtxt.read(), step_stats_pb2.StepStats())
         
     def _get_session_run_activity_name(self):
         return Analyzer._SESSION_RUN_ACTIVITY
@@ -437,30 +444,30 @@ class Analyzer(object):
         for step in self._activity_stats_collection:
             activity_stats[step] = {}
             for activity_name in self._activity_stats_collection[step]:
-                elapse = self._activity_stats_collection[step][activity_name]["end"] - self._activity_stats_collection[step][activity_name]["start"]
-                activity_stats[step][activity_name] = {"elapse":elapse}
+                elapse = self._activity_stats_collection[step][activity_name]['end'] - self._activity_stats_collection[step][activity_name]['start']
+                activity_stats[step][activity_name] = {'elapse':elapse}
         activity_overall_stats = {}
         activity_step_times = {}
         activity_step_times[self._get_session_run_activity_name()] = []
         for step in activity_stats:
             for session_run_activity_name in activity_step_times:
-                activity_step_times[session_run_activity_name].append(activity_stats[step][session_run_activity_name]["elapse"])
+                activity_step_times[session_run_activity_name].append(activity_stats[step][session_run_activity_name]['elapse'])
 
         for session_run_activity_name, step_times in activity_step_times.items():
             total_time = numpy.sum(numpy.asarray(step_times))
 
-            throughput = "N/A"
-            throughput_min = "N/A"
-            throughput_mean = "N/A"
-            throughput_median = "N/A"
-            throughput_max = "N/A"
-            throughput_99th_percentile = "N/A"
+            throughput = 'N/A'
+            throughput_min = 'N/A'
+            throughput_mean = 'N/A'
+            throughput_median = 'N/A'
+            throughput_max = 'N/A'
+            throughput_99th_percentile = 'N/A'
 
-            the_99th_percentile = "N/A"
-            latency_mean = "N/A"
-            latency_median = "N/A"
-            latency_min = "N/A"
-            latency_max = "N/A"
+            the_99th_percentile = 'N/A'
+            latency_mean = 'N/A'
+            latency_median = 'N/A'
+            latency_min = 'N/A'
+            latency_max = 'N/A'
 
             if self._batch_size > 0 and step_times:
                 throughput = self._batch_size / numpy.asarray(step_times)
@@ -468,27 +475,27 @@ class Analyzer(object):
                 throughput_mean = numpy.mean(throughput)
                 throughput_median = numpy.median(throughput)
                 throughput_max = numpy.max(throughput)
-                throughput_99th_percentile = numpy.percentile(numpy.asarray(throughput), q=99, interpolation="lower")
+                throughput_99th_percentile = numpy.percentile(numpy.asarray(throughput), q=99, interpolation='lower')
 
-                the_99th_percentile = numpy.percentile(numpy.asarray(step_times), q=99, interpolation="lower")
+                the_99th_percentile = numpy.percentile(numpy.asarray(step_times), q=99, interpolation='lower')
                 latency_mean = numpy.mean(numpy.asarray(step_times))
                 latency_median = numpy.median(numpy.asarray(step_times))
                 latency_min= numpy.min(numpy.asarray(step_times))
                 latency_max= numpy.max(numpy.asarray(step_times))
 
             overall_stats = {
-                "batch_size": self._batch_size,
-                "total_time": total_time,
-                "throughput_min": throughput_min,
-                "throughput_mean":throughput_mean,
-                "throughput_median": throughput_median,
-                "throughput_max": throughput_max,
-                "throughput_99th_percentile":throughput_99th_percentile,
-                "latency_99th_percentile": the_99th_percentile,
-                "latency_mean": latency_mean,
-                "latency_median": latency_median,
-                "latency_min": latency_min,
-                "latency_max": latency_max,
+                'batch_size': self._batch_size,
+                'total_time': total_time,
+                'throughput_min': throughput_min,
+                'throughput_mean':throughput_mean,
+                'throughput_median': throughput_median,
+                'throughput_max': throughput_max,
+                'throughput_99th_percentile':throughput_99th_percentile,
+                'latency_99th_percentile': the_99th_percentile,
+                'latency_mean': latency_mean,
+                'latency_median': latency_median,
+                'latency_min': latency_min,
+                'latency_max': latency_max,
             }
             activity_overall_stats = overall_stats
         return activity_overall_stats
@@ -497,9 +504,9 @@ class Analyzer(object):
         summary = {}
         for name, value in kwargs.items():
             summary[name] = value
-        summary_json_file_path = "{}/{}.json".format(self._logdir, Analyzer._SUMMARIES_FILE_NAME)
+        summary_json_file_path = '{}/{}.json'.format(self._logdir, Analyzer._SUMMARIES_FILE_NAME)
         summary_json = json.dumps(summary, indent = 2)
-        with open(summary_json_file_path,"w+") as f:
+        with open(summary_json_file_path,'w+') as f:
             f.write(summary_json)
     
     # trim dupliacted information in step_stats
@@ -508,9 +515,9 @@ class Analyzer(object):
         collector_stats_list = []
         # found duplicated stats on host
         for dev_stats in step_stats.dev_stats:
-            if dev_stats.device == "/host:CPU" or "stream:all" in dev_stats.device:
+            if dev_stats.device == '/host:CPU' or 'stream:all' in dev_stats.device:
                 continue
-            elif "job" in dev_stats.device:
+            elif 'job' in dev_stats.device:
                 collector_stats_list.append(dev_stats)
                 continue
             else:
@@ -518,7 +525,7 @@ class Analyzer(object):
                 _dev_stats.CopyFrom(dev_stats)
         # merge duplicated host traces
         _host_stats = trimmed_step_stats.dev_stats.add()
-        _host_stats.device = "/host:CPU"
+        _host_stats.device = '/host:CPU'
         for _dev_stats in collector_stats_list:
             for node_stats in _dev_stats.node_stats:
                 _node_stats = _host_stats.node_stats.add()
@@ -551,7 +558,7 @@ class Analyzer(object):
 
         kernel_stats_list = []
         for dev_stats in trimmed_step_stats.dev_stats:
-            if "gpu" in dev_stats.device and "MemcpyDtoH" not in dev_stats.device and "MemcpyHtoD" not in dev_stats.device:
+            if 'gpu' in dev_stats.device and 'MemcpyDtoH' not in dev_stats.device and 'MemcpyHtoD' not in dev_stats.device:
                 kernel_stats_list.append(dev_stats)
         kernel_stats = pandas.DataFrame(columns = ['op_type', 'op_id', 'kernel_name', 'start_ns', 'elapse_ns', 'use_tensor_core'])
         for dev_stats in kernel_stats_list:
@@ -603,7 +610,7 @@ class Analyzer(object):
 
         # op stats
         op_stats = pandas.DataFrame(columns = ['step', 'op_type', 'op_id', 'start_ns', 'host_elapse_ns', 'devie_elapse_ns', 'is_kernen_launch', 'run_on'])
-        for step, step_stats in self._step_stats_list["step_stats"].items():
+        for step, step_stats in self._raw_stats['step_stats'].items():
             trimmed_step_stats = Analyzer.trim_step_stats(step_stats)
             host_op_stats = Analyzer.extract_host_op_stats(trimmed_step_stats)
             kernel_stats  = Analyzer.extract_kernel_stats(trimmed_step_stats)
@@ -611,6 +618,6 @@ class Analyzer(object):
                 kernel_stats.rename(columns={'elapse_ns':'kernel_elapse_ns', 'start_ns':'kernel_start_ns'}),
                 how='left', on=['op_type', 'op_id'])
         print(op_stats)
-        op_stats.to_json("op_stats.json")
-        op_stats.to_excel("op_stats.xlsx")
-        op_stats.to_csv("op_stats.csv")
+        op_stats.to_json('op_stats.json')
+        op_stats.to_excel('op_stats.xlsx')
+        op_stats.to_csv('op_stats.csv')
