@@ -37,7 +37,7 @@ def TFLowLevelApi_TrainAndInference():
 
     from tfprof import Profiler, ProfilerOptions
 
-    profiler = Profiler(options=ProfilerOptions(host_tracer_level=2, device_tracer_level=1))
+    profiler = Profiler(options=ProfilerOptions(host_tracer_level=1, device_tracer_level=1))
     run_options = tf.compat.v1.RunOptions(trace_level = profiler.get_trace_level())
     run_options.output_partition_graphs = True
 
@@ -56,4 +56,10 @@ def TFLowLevelApi_TrainAndInference():
 
     profiler.finalize(batch_size=batch_size)
 
+def Analyzer_Test():
+    from tfprof import Analyzer
+    Analyzer(logdir="logdir", batch_size=256).generate_summary()
+
 TFLowLevelApi_TrainAndInference()
+
+Analyzer_Test()

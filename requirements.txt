@@ -1,4 +1,2 @@
-ujson
 pandas
-numpy
 absl-py
